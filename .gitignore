@@ -1,0 +1,12 @@
+# Build outputs
+bin/
+obj/
+
+# Visual Studio
+.vs/
+
+# Debug files
+*.txt
+
+# Claude settings
+.claude/
