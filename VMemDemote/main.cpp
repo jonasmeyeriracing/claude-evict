@@ -35,6 +35,9 @@ static TRACEHANDLE g_sessionHandle = 0;
 static TRACEHANDLE g_traceHandle = INVALID_PROCESSTRACE_HANDLE;
 static bool g_debugMode = false;
 
+// Track the current target process PID (0 = no active target)
+static std::atomic<DWORD> g_currentTargetPid{ 0 };
+
 // Statistics tracking
 static std::atomic<ULONGLONG> g_totalAllocated{ 0 };
 static std::atomic<ULONGLONG> g_totalFreed{ 0 };
@@ -112,6 +115,74 @@ bool IsTargetProcess(DWORD pid) {
         return false;
     }
     return ToLower(processName) == ToLower(g_targetExeName);
+}
+
+// Reset all statistics and tracking data (called when target process restarts)
+void ResetStatistics() {
+    // Reset counters
+    g_totalAllocated = 0;
+    g_totalFreed = 0;
+    g_totalEvicted = 0;
+    g_totalMadeResident = 0;
+    g_allocationCount = 0;
+    g_freeCount = 0;
+    g_evictionCount = 0;
+    g_madeResidentCount = 0;
+    g_currentDemotedCommitment = 0;
+    g_peakDemotedCommitment = 0;
+
+    // Clear allocation tracking maps
+    {
+        std::lock_guard<std::mutex> lock(g_allocationMapMutex);
+        g_allocationSizeMap.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_targetAllocMutex);
+        g_targetAllocSizeMap.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_adapterAllocMutex);
+        g_targetAdapterAllocations.clear();
+    }
+}
+
+// Check if a PID is our target and handle process start/restart
+// Returns true if this is the target process, false otherwise
+bool CheckTargetProcess(DWORD pid) {
+    if (pid == 0) {
+        return false;
+    }
+
+    // Quick check: if this is the current tracked PID, it's definitely target
+    DWORD currentPid = g_currentTargetPid.load();
+    if (currentPid != 0 && pid == currentPid) {
+        return true;
+    }
+
+    // Check if this PID matches our target process name
+    if (!IsTargetProcess(pid)) {
+        return false;
+    }
+
+    // This PID matches target process name
+    // Check if this is a new/different process instance
+    if (currentPid == 0) {
+        // First time seeing the target process
+        g_currentTargetPid = pid;
+        wprintf(L"\n[PROCESS] Target process started: %s (PID: %lu)\n", g_targetExeName.c_str(), pid);
+        fflush(stdout);
+    } else if (pid != currentPid) {
+        // Different PID - process was restarted
+        wprintf(L"\n[PROCESS] Target process restarted: %s (PID: %lu -> %lu)\n",
+                g_targetExeName.c_str(), currentPid, pid);
+        wprintf(L"[PROCESS] Resetting statistics for new instance...\n\n");
+        fflush(stdout);
+
+        ResetStatistics();
+        g_currentTargetPid = pid;
+    }
+
+    return true;
 }
 
 // Get property value from event record
@@ -420,7 +491,7 @@ void WINAPI EventRecordCallback(PEVENT_RECORD pEvent) {
         DWORD eventPid = 0;
         GetEventPropertyDWORD(pEvent, pInfo, L"ProcessId", &eventPid);
 
-        if (eventPid != 0 && IsTargetProcess(eventPid)) {
+        if (CheckTargetProcess(eventPid)) {
             ULONGLONG newDemoted = 0, oldDemoted = 0;
             // Property names are "Commitment" and "OldCommitment" for this event type
             GetEventPropertyULONGLONG(pEvent, pInfo, L"Commitment", &newDemoted);
@@ -459,7 +530,7 @@ void WINAPI EventRecordCallback(PEVENT_RECORD pEvent) {
             }
         }
 
-        if (eventPid != 0 && IsTargetProcess(eventPid)) {
+        if (CheckTargetProcess(eventPid)) {
             ULONGLONG newUsage = 0, oldUsage = 0;
             DWORD segmentGroup = 0;
             GetEventPropertyULONGLONG(pEvent, pInfo, L"NewUsage", &newUsage);
@@ -500,7 +571,7 @@ void WINAPI EventRecordCallback(PEVENT_RECORD pEvent) {
     if (eventType == EventType::MadeResident) {
         DWORD headerPid = pEvent->EventHeader.ProcessId;
 
-        if (headerPid != 0 && IsTargetProcess(headerPid)) {
+        if (CheckTargetProcess(headerPid)) {
             ULONGLONG pVidMmAlloc = 0;
             ULONGLONG allocSize = 0;
             GetEventPropertyULONGLONG(pEvent, pInfo, L"pVidMmAlloc", &pVidMmAlloc);
@@ -574,7 +645,7 @@ void WINAPI EventRecordCallback(PEVENT_RECORD pEvent) {
     }
 
     // Check if this is our target process
-    if (pid != 0 && IsTargetProcess(pid)) {
+    if (CheckTargetProcess(pid)) {
         if (eventType == EventType::Allocation) {
             // AdapterAllocation: get allocSize and hVidMmGlobalAlloc
             GetEventPropertyULONGLONG(pEvent, pInfo, L"allocSize", &size);
