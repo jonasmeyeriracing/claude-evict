@@ -39,9 +39,14 @@ static bool g_debugMode = false;
 static std::atomic<DWORD> g_currentTargetPid{ 0 };
 
 // Statistics tracking
-static std::atomic<ULONGLONG> g_currentAllocated{ 0 };  // Net allocated (alloc - free)
+static std::atomic<ULONGLONG> g_totalAllocated{ 0 };
+static std::atomic<ULONGLONG> g_totalFreed{ 0 };
+static std::atomic<ULONGLONG> g_totalEvicted{ 0 };
+static std::atomic<ULONGLONG> g_totalMadeResident{ 0 };
 static std::atomic<ULONG> g_allocationCount{ 0 };
 static std::atomic<ULONG> g_freeCount{ 0 };
+static std::atomic<ULONG> g_evictionCount{ 0 };
+static std::atomic<ULONG> g_madeResidentCount{ 0 };
 
 // Track demoted commitment from VidMmProcessDemotedCommitmentChange events
 static std::atomic<ULONGLONG> g_currentDemotedCommitment{ 0 };
@@ -115,9 +120,14 @@ bool IsTargetProcess(DWORD pid) {
 // Reset all statistics and tracking data (called when target process restarts)
 void ResetStatistics() {
     // Reset counters
-    g_currentAllocated = 0;
+    g_totalAllocated = 0;
+    g_totalFreed = 0;
+    g_totalEvicted = 0;
+    g_totalMadeResident = 0;
     g_allocationCount = 0;
     g_freeCount = 0;
+    g_evictionCount = 0;
+    g_madeResidentCount = 0;
     g_currentDemotedCommitment = 0;
     g_peakDemotedCommitment = 0;
 
@@ -327,16 +337,20 @@ void PrintEventInfo(PEVENT_RECORD pEvent, PTRACE_EVENT_INFO /*pInfo*/, DWORD pid
     // Update statistics first
     switch (eventType) {
         case EventType::Allocation:
-            g_currentAllocated += size;
+            g_totalAllocated += size;
             g_allocationCount++;
             break;
         case EventType::Free:
-            // Subtract from current allocated (but don't go negative)
-            {
-                ULONGLONG current = g_currentAllocated.load();
-                while (current >= size && !g_currentAllocated.compare_exchange_weak(current, current - size)) {}
-            }
+            g_totalFreed += size;
             g_freeCount++;
+            break;
+        case EventType::Eviction:
+            g_totalEvicted += size;
+            g_evictionCount++;
+            break;
+        case EventType::MadeResident:
+            g_totalMadeResident += size;
+            g_madeResidentCount++;
             break;
         default:
             break;
@@ -355,15 +369,15 @@ void PrintEventInfo(PEVENT_RECORD pEvent, PTRACE_EVENT_INFO /*pInfo*/, DWORD pid
         FormatSize(size, sizeStr, _countof(sizeStr));
     }
 
-    // Format running totals: Total = current allocated, Evict = demoted, Resident = Total - Evict
-    wchar_t totalStr[64], evictStr[64], residentStr[64];
-    ULONGLONG total = g_currentAllocated.load();
-    ULONGLONG evicted = g_currentDemotedCommitment.load();
-    ULONGLONG resident = (total > evicted) ? (total - evicted) : 0;
+    // Format running totals
+    wchar_t allocTotalStr[64], evictTotalStr[64], residentTotalStr[64];
+    ULONGLONG allocated = g_totalAllocated.load();
+    ULONGLONG resident = g_totalMadeResident.load();
+    ULONGLONG peakDemoted = g_peakDemotedCommitment.load();
 
-    FormatSize(total, totalStr, _countof(totalStr));
-    FormatSize(evicted, evictStr, _countof(evictStr));
-    FormatSize(resident, residentStr, _countof(residentStr));
+    FormatSize(allocated, allocTotalStr, _countof(allocTotalStr));
+    FormatSize(peakDemoted, evictTotalStr, _countof(evictTotalStr));
+    FormatSize(resident, residentTotalStr, _countof(residentTotalStr));
 
     // Print based on event type
     const wchar_t* eventTypeName = GetEventTypeName(eventType);
@@ -376,34 +390,35 @@ void PrintEventInfo(PEVENT_RECORD pEvent, PTRACE_EVENT_INFO /*pInfo*/, DWORD pid
         wprintf(L" - Size: %s", sizeStr);
     }
 
-    // Print running totals: Total ≈ Evict + Resident
-    wprintf(L" | Total=%s, Evict=%s, Resident=%s\n",
-            totalStr, evictStr, residentStr);
+    // Print running totals (Evict shows peak demoted commitment from VidMmProcessDemotedCommitmentChange)
+    wprintf(L" | Totals: Alloc=%s, Evict=%s, Resident=%s\n",
+            allocTotalStr, evictTotalStr, residentTotalStr);
 
     fflush(stdout);
 }
 
 // Print current statistics summary
 void PrintStatistics() {
-    wchar_t totalStr[64], evictStr[64], residentStr[64], peakEvictStr[64];
+    wchar_t allocStr[64], freeStr[64], demotedStr[64], residentStr[64], netStr[64];
 
-    ULONGLONG total = g_currentAllocated.load();
-    ULONGLONG evicted = g_currentDemotedCommitment.load();
-    ULONGLONG peakEvicted = g_peakDemotedCommitment.load();
-    ULONGLONG resident = (total > evicted) ? (total - evicted) : 0;
+    ULONGLONG allocated = g_totalAllocated.load();
+    ULONGLONG freed = g_totalFreed.load();
+    ULONGLONG peakDemoted = g_peakDemotedCommitment.load();
+    ULONGLONG madeResident = g_totalMadeResident.load();
+    LONGLONG net = (LONGLONG)allocated - (LONGLONG)freed;
 
-    FormatSize(total, totalStr, _countof(totalStr));
-    FormatSize(evicted, evictStr, _countof(evictStr));
-    FormatSize(resident, residentStr, _countof(residentStr));
-    FormatSize(peakEvicted, peakEvictStr, _countof(peakEvictStr));
+    FormatSize(allocated, allocStr, _countof(allocStr));
+    FormatSize(freed, freeStr, _countof(freeStr));
+    FormatSize(peakDemoted, demotedStr, _countof(demotedStr));
+    FormatSize(madeResident, residentStr, _countof(residentStr));
+    FormatSize(net > 0 ? (ULONGLONG)net : (ULONGLONG)(-net), netStr, _countof(netStr));
 
     wprintf(L"\n=== Video Memory Statistics ===\n");
-    wprintf(L"Allocations:    %lu\n", g_allocationCount.load());
-    wprintf(L"Frees:          %lu\n", g_freeCount.load());
-    wprintf(L"Total Memory:   %s\n", totalStr);
-    wprintf(L"Evicted:        %s\n", evictStr);
-    wprintf(L"Resident:       %s\n", residentStr);
-    wprintf(L"Peak Evicted:   %s\n", peakEvictStr);
+    wprintf(L"Allocations:   %lu (Total: %s)\n", g_allocationCount.load(), allocStr);
+    wprintf(L"Frees:         %lu (Total: %s)\n", g_freeCount.load(), freeStr);
+    wprintf(L"Net Memory:    %s%s\n", net < 0 ? L"-" : L"", netStr);
+    wprintf(L"Peak Demoted:  %s\n", demotedStr);
+    wprintf(L"Made Resident: %lu (Total: %s)\n", g_madeResidentCount.load(), residentStr);
     wprintf(L"===============================\n\n");
 }
 
@@ -487,16 +502,16 @@ void WINAPI EventRecordCallback(PEVENT_RECORD pEvent) {
             ULONGLONG currentPeak = g_peakDemotedCommitment.load();
             while (newDemoted > currentPeak && !g_peakDemotedCommitment.compare_exchange_weak(currentPeak, newDemoted)) {}
 
-            // Print demoted commitment changes with full stats
-            ULONGLONG total = g_currentAllocated.load();
-            ULONGLONG resident = (total > newDemoted) ? (total - newDemoted) : 0;
+            LONGLONG delta = (LONGLONG)newDemoted - (LONGLONG)oldDemoted;
+            if (delta > 0) {
+                g_evictionCount++;
+            }
 
-            wchar_t totalStr[64], evictStr[64], residentStr[64];
-            FormatSize(total, totalStr, _countof(totalStr));
-            FormatSize(newDemoted, evictStr, _countof(evictStr));
-            FormatSize(resident, residentStr, _countof(residentStr));
-
-            wprintf(L"[DEMOTED] Total=%s, Evict=%s, Resident=%s\n", totalStr, evictStr, residentStr);
+            // Print demoted commitment changes
+            wchar_t newVal[64], peakVal[64];
+            FormatSize(newDemoted, newVal, _countof(newVal));
+            FormatSize(g_peakDemotedCommitment.load(), peakVal, _countof(peakVal));
+            wprintf(L"[DEMOTED] Current: %s, Peak: %s\n", newVal, peakVal);
             fflush(stdout);
         }
         free(pInfo);
@@ -645,13 +660,8 @@ void WINAPI EventRecordCallback(PEVENT_RECORD pEvent) {
             }
         }
         else if (eventType == EventType::Free) {
-            // TerminateAllocation: try hVidMmGlobalAlloc first (matches ALLOC), then hVidMmAlloc
-            ULONGLONG globalAlloc = 0;
-            GetEventPropertyULONGLONG(pEvent, pInfo, L"hVidMmGlobalAlloc", &globalAlloc);
-            if (globalAlloc == 0) {
-                GetEventPropertyULONGLONG(pEvent, pInfo, L"hVidMmAlloc", &globalAlloc);
-            }
-            allocPtr = globalAlloc;
+            // TerminateAllocation: get hVidMmAlloc, look up size, remove from map
+            GetEventPropertyULONGLONG(pEvent, pInfo, L"hVidMmAlloc", &allocPtr);
 
             if (allocPtr != 0) {
                 std::lock_guard<std::mutex> lock(g_allocationMapMutex);
