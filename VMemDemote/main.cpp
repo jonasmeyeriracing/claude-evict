@@ -45,14 +45,23 @@ static std::atomic<ULONG> g_freeCount{ 0 };
 static std::atomic<ULONG> g_evictionCount{ 0 };
 static std::atomic<ULONG> g_madeResidentCount{ 0 };
 
-// Allocation tracking: maps allocation pointer (hVidMmAlloc) to size
+// Track demoted commitment from VidMmProcessDemotedCommitmentChange events
+static std::atomic<ULONGLONG> g_currentDemotedCommitment{ 0 };
+static std::atomic<ULONGLONG> g_peakDemotedCommitment{ 0 };
+
+// Allocation tracking: maps allocation pointer (hVidMmGlobalAlloc) to size
 static std::unordered_map<ULONGLONG, ULONGLONG> g_allocationSizeMap;
 static std::mutex g_allocationMapMutex;
 
-// Track pVidMmAlloc pointers that belong to our target process
+// Track pVidMmAlloc pointers that belong to our target process -> size
 // We learn ownership from VidMmMakeResident events where header ProcessId is target
-static std::unordered_set<ULONGLONG> g_targetAllocations;
+static std::unordered_map<ULONGLONG, ULONGLONG> g_targetAllocSizeMap;
 static std::mutex g_targetAllocMutex;
+
+// Track pDxgAdapterAllocation from Start events to correlate with Stop events
+// Maps pDxgAdapterAllocation -> (process belongs to target)
+static std::unordered_set<ULONGLONG> g_targetAdapterAllocations;
+static std::mutex g_adapterAllocMutex;
 
 
 // Event type enumeration
@@ -291,9 +300,13 @@ void PrintEventInfo(PEVENT_RECORD pEvent, PTRACE_EVENT_INFO /*pInfo*/, DWORD pid
 
     // Format running totals
     wchar_t allocTotalStr[64], evictTotalStr[64], residentTotalStr[64];
-    FormatSize(g_totalAllocated.load(), allocTotalStr, _countof(allocTotalStr));
-    FormatSize(g_totalEvicted.load(), evictTotalStr, _countof(evictTotalStr));
-    FormatSize(g_totalMadeResident.load(), residentTotalStr, _countof(residentTotalStr));
+    ULONGLONG allocated = g_totalAllocated.load();
+    ULONGLONG resident = g_totalMadeResident.load();
+    ULONGLONG peakDemoted = g_peakDemotedCommitment.load();
+
+    FormatSize(allocated, allocTotalStr, _countof(allocTotalStr));
+    FormatSize(peakDemoted, evictTotalStr, _countof(evictTotalStr));
+    FormatSize(resident, residentTotalStr, _countof(residentTotalStr));
 
     // Print based on event type
     const wchar_t* eventTypeName = GetEventTypeName(eventType);
@@ -306,7 +319,7 @@ void PrintEventInfo(PEVENT_RECORD pEvent, PTRACE_EVENT_INFO /*pInfo*/, DWORD pid
         wprintf(L" - Size: %s", sizeStr);
     }
 
-    // Print running totals
+    // Print running totals (Evict shows peak demoted commitment from VidMmProcessDemotedCommitmentChange)
     wprintf(L" | Totals: Alloc=%s, Evict=%s, Resident=%s\n",
             allocTotalStr, evictTotalStr, residentTotalStr);
 
@@ -315,17 +328,17 @@ void PrintEventInfo(PEVENT_RECORD pEvent, PTRACE_EVENT_INFO /*pInfo*/, DWORD pid
 
 // Print current statistics summary
 void PrintStatistics() {
-    wchar_t allocStr[64], freeStr[64], evictStr[64], residentStr[64], netStr[64];
+    wchar_t allocStr[64], freeStr[64], demotedStr[64], residentStr[64], netStr[64];
 
     ULONGLONG allocated = g_totalAllocated.load();
     ULONGLONG freed = g_totalFreed.load();
-    ULONGLONG evicted = g_totalEvicted.load();
+    ULONGLONG peakDemoted = g_peakDemotedCommitment.load();
     ULONGLONG madeResident = g_totalMadeResident.load();
     LONGLONG net = (LONGLONG)allocated - (LONGLONG)freed;
 
     FormatSize(allocated, allocStr, _countof(allocStr));
     FormatSize(freed, freeStr, _countof(freeStr));
-    FormatSize(evicted, evictStr, _countof(evictStr));
+    FormatSize(peakDemoted, demotedStr, _countof(demotedStr));
     FormatSize(madeResident, residentStr, _countof(residentStr));
     FormatSize(net > 0 ? (ULONGLONG)net : (ULONGLONG)(-net), netStr, _countof(netStr));
 
@@ -333,7 +346,7 @@ void PrintStatistics() {
     wprintf(L"Allocations:   %lu (Total: %s)\n", g_allocationCount.load(), allocStr);
     wprintf(L"Frees:         %lu (Total: %s)\n", g_freeCount.load(), freeStr);
     wprintf(L"Net Memory:    %s%s\n", net < 0 ? L"-" : L"", netStr);
-    wprintf(L"Evictions:     %lu (Total: %s)\n", g_evictionCount.load(), evictStr);
+    wprintf(L"Peak Demoted:  %s\n", demotedStr);
     wprintf(L"Made Resident: %lu (Total: %s)\n", g_madeResidentCount.load(), residentStr);
     wprintf(L"===============================\n\n");
 }
@@ -402,42 +415,49 @@ void WINAPI EventRecordCallback(PEVENT_RECORD pEvent) {
         taskName = (const wchar_t*)((BYTE*)pInfo + pInfo->TaskNameOffset);
     }
 
-    // Track PagingQueuePacket events - these have correct ProcessId and precede VidMmEvict
-    // VidMmOpType: 206 = MakeResident, 207 = Evict
-    if (taskName && _wcsicmp(taskName, L"PagingQueuePacket") == 0) {
-        static std::atomic<ULONG> pqTotalCount{ 0 };
-        static std::atomic<ULONG> pqEvictCount{ 0 };
+    // Handle VidMmProcessDemotedCommitmentChange - this tracks DEMOTED memory (evictions)
+    if (taskName && _wcsicmp(taskName, L"VidMmProcessDemotedCommitmentChange") == 0) {
+        DWORD eventPid = 0;
+        GetEventPropertyDWORD(pEvent, pInfo, L"ProcessId", &eventPid);
 
-        DWORD headerPid = pEvent->EventHeader.ProcessId;
-        DWORD opType = 0;
-        GetEventPropertyDWORD(pEvent, pInfo, L"VidMmOpType", &opType);
+        if (eventPid != 0 && IsTargetProcess(eventPid)) {
+            ULONGLONG newDemoted = 0, oldDemoted = 0;
+            // Property names are "Commitment" and "OldCommitment" for this event type
+            GetEventPropertyULONGLONG(pEvent, pInfo, L"Commitment", &newDemoted);
+            GetEventPropertyULONGLONG(pEvent, pInfo, L"OldCommitment", &oldDemoted);
 
-        ULONG total = ++pqTotalCount;
-        if (total % 1000 == 0) {
-            wprintf(L"  [DEBUG] PagingQueuePacket total: %lu (last PID=%lu, OpType=%lu)\n",
-                    total, headerPid, opType);
-            fflush(stdout);
-        }
+            // Update global tracking of demoted commitment
+            g_currentDemotedCommitment = newDemoted;
+            ULONGLONG currentPeak = g_peakDemotedCommitment.load();
+            while (newDemoted > currentPeak && !g_peakDemotedCommitment.compare_exchange_weak(currentPeak, newDemoted)) {}
 
-        if (headerPid != 0 && IsTargetProcess(headerPid) && opType == 207) {
-            ULONG count = ++pqEvictCount;
-            g_evictionCount++;
-
-            if (count % 100 == 0) {
-                wprintf(L"  [DEBUG] PagingQueuePacket evictions for target: %lu\n", count);
-                fflush(stdout);
+            LONGLONG delta = (LONGLONG)newDemoted - (LONGLONG)oldDemoted;
+            if (delta > 0) {
+                g_evictionCount++;
             }
+
+            // Print demoted commitment changes
+            wchar_t newVal[64], peakVal[64];
+            FormatSize(newDemoted, newVal, _countof(newVal));
+            FormatSize(g_peakDemotedCommitment.load(), peakVal, _countof(peakVal));
+            wprintf(L"[DEMOTED] Current: %s, Peak: %s\n", newVal, peakVal);
+            fflush(stdout);
         }
         free(pInfo);
         return;
     }
 
-    // Handle VidMmProcessUsageChange - this directly tells us about memory usage changes
+    // Handle VidMmProcessUsageChange - tracks memory usage changes in VRAM
     // Positive delta = memory made resident, Negative delta = memory evicted
     if (taskName && _wcsicmp(taskName, TASK_VIDMM_PROCESS_USAGE_CHANGE) == 0) {
         // This event has ProcessId property and NewUsage/OldUsage
         DWORD eventPid = 0;
-        GetEventPropertyDWORD(pEvent, pInfo, L"ProcessId", &eventPid);
+        ULONGLONG hProcessId = 0;
+        if (!GetEventPropertyDWORD(pEvent, pInfo, L"ProcessId", &eventPid) || eventPid == 0) {
+            if (GetEventPropertyULONGLONG(pEvent, pInfo, L"hProcessId", &hProcessId) && hProcessId != 0) {
+                eventPid = (DWORD)hProcessId;
+            }
+        }
 
         if (eventPid != 0 && IsTargetProcess(eventPid)) {
             ULONGLONG newUsage = 0, oldUsage = 0;
@@ -448,12 +468,15 @@ void WINAPI EventRecordCallback(PEVENT_RECORD pEvent) {
 
             LONGLONG delta = (LONGLONG)newUsage - (LONGLONG)oldUsage;
 
-            if (delta != 0) {
-                // Determine event type from delta direction
-                EventType usageEventType = (delta > 0) ? EventType::MadeResident : EventType::Eviction;
+            // Only track segment 0 (local VRAM) changes
+            if (delta != 0 && segmentGroup == 0) {
                 ULONGLONG size = (delta > 0) ? (ULONGLONG)delta : (ULONGLONG)(-delta);
 
-                PrintEventInfo(pEvent, pInfo, eventPid, usageEventType, size);
+                if (delta < 0) {
+                    PrintEventInfo(pEvent, pInfo, eventPid, EventType::Eviction, size);
+                } else {
+                    PrintEventInfo(pEvent, pInfo, eventPid, EventType::MadeResident, size);
+                }
             }
         }
         free(pInfo);
@@ -475,26 +498,21 @@ void WINAPI EventRecordCallback(PEVENT_RECORD pEvent) {
 
     // Track VidMmMakeResident to learn which allocations belong to our target
     if (eventType == EventType::MadeResident) {
-        static std::atomic<ULONG> residentTotalCount{ 0 };
-        static std::atomic<ULONG> residentTargetCount{ 0 };
-
         DWORD headerPid = pEvent->EventHeader.ProcessId;
 
-        ULONG total = ++residentTotalCount;
-        if (total % 500 == 0) {
-            wprintf(L"  [DEBUG] VidMmMakeResident total: %lu, from target: %lu, tracked allocs: %zu (last PID %lu)\n",
-                    total, residentTargetCount.load(), g_targetAllocations.size(), headerPid);
-            fflush(stdout);
-        }
-
         if (headerPid != 0 && IsTargetProcess(headerPid)) {
-            ++residentTargetCount;
             ULONGLONG pVidMmAlloc = 0;
+            ULONGLONG allocSize = 0;
             GetEventPropertyULONGLONG(pEvent, pInfo, L"pVidMmAlloc", &pVidMmAlloc);
+            GetEventPropertyULONGLONG(pEvent, pInfo, L"Size", &allocSize);
 
             if (pVidMmAlloc != 0) {
                 std::lock_guard<std::mutex> lock(g_targetAllocMutex);
-                g_targetAllocations.insert(pVidMmAlloc);
+                if (allocSize > 0) {
+                    g_targetAllocSizeMap[pVidMmAlloc] = allocSize;
+                } else if (g_targetAllocSizeMap.find(pVidMmAlloc) == g_targetAllocSizeMap.end()) {
+                    g_targetAllocSizeMap[pVidMmAlloc] = 0;
+                }
             }
         }
         free(pInfo);
@@ -502,29 +520,33 @@ void WINAPI EventRecordCallback(PEVENT_RECORD pEvent) {
     }
 
     // Track VidMmEvict - check if the allocation belongs to our target
+    // Note: VidMmEvict events don't have reliable ProcessId, so we correlate via allocation pointers
+    // The main eviction tracking is done via VidMmProcessDemotedCommitmentChange
     if (eventType == EventType::Eviction) {
-        static std::atomic<ULONG> rawEvictTotalCount{ 0 };
-        static std::atomic<ULONG> targetEvictCount{ 0 };
-
+        ULONGLONG hVidMmAlloc = 0;
         ULONGLONG pVidMmAlloc = 0;
+        ULONGLONG evictEventSize = 0;
+        GetEventPropertyULONGLONG(pEvent, pInfo, L"hVidMmAlloc", &hVidMmAlloc);
         GetEventPropertyULONGLONG(pEvent, pInfo, L"pVidMmAlloc", &pVidMmAlloc);
+        GetEventPropertyULONGLONG(pEvent, pInfo, L"Size", &evictEventSize);
 
-        ULONG total = ++rawEvictTotalCount;
-        if (total % 500 == 0) {
-            DWORD headerPid = pEvent->EventHeader.ProcessId;
-            wprintf(L"  [DEBUG] VidMmEvict total: %lu, target evicts: %lu (last from PID %lu)\n",
-                    total, targetEvictCount.load(), headerPid);
-            fflush(stdout);
+        // Look up size from allocation map using hVidMmAlloc
+        ULONGLONG evictSize = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_allocationMapMutex);
+            auto it = g_allocationSizeMap.find(hVidMmAlloc);
+            if (it != g_allocationSizeMap.end()) {
+                evictSize = it->second;
+            }
         }
 
-        // Check if this allocation belongs to our target
-        if (pVidMmAlloc != 0) {
+        // Also check pVidMmAlloc in target allocations map
+        if (evictSize == 0 && pVidMmAlloc != 0) {
             std::lock_guard<std::mutex> lock(g_targetAllocMutex);
-            if (g_targetAllocations.count(pVidMmAlloc) > 0) {
-                ++targetEvictCount;
-                g_evictionCount++;
-                // Remove from set since it's no longer resident
-                g_targetAllocations.erase(pVidMmAlloc);
+            auto it = g_targetAllocSizeMap.find(pVidMmAlloc);
+            if (it != g_targetAllocSizeMap.end()) {
+                evictSize = (evictEventSize > 0) ? evictEventSize : it->second;
+                g_targetAllocSizeMap.erase(it);
             }
         }
 
@@ -532,45 +554,55 @@ void WINAPI EventRecordCallback(PEVENT_RECORD pEvent) {
         return;
     }
 
-    {
-        // For Allocation and Free events: use standard process ID lookup
-        bool foundPid = GetEventPropertyDWORD(pEvent, pInfo, L"ProcessId", &pid) ||
-                        GetEventPropertyDWORD(pEvent, pInfo, L"hProcess", &pid) ||
-                        GetEventPropertyDWORD(pEvent, pInfo, L"Context", &pid);
-
-        // If no PID in properties, use event header PID
-        if (!foundPid || pid == 0) {
-            pid = pEvent->EventHeader.ProcessId;
+    // For Allocation and Free events: use standard process ID lookup
+    ULONGLONG hProcessId = 0;
+    bool foundPid = GetEventPropertyDWORD(pEvent, pInfo, L"ProcessId", &pid);
+    if (!foundPid || pid == 0) {
+        if (GetEventPropertyULONGLONG(pEvent, pInfo, L"hProcessId", &hProcessId) && hProcessId != 0) {
+            pid = (DWORD)hProcessId;
+            foundPid = true;
         }
+    }
+    if (!foundPid || pid == 0) {
+        foundPid = GetEventPropertyDWORD(pEvent, pInfo, L"hProcess", &pid) ||
+                   GetEventPropertyDWORD(pEvent, pInfo, L"Context", &pid);
+    }
 
-        // Check if this is our target process
-        if (pid != 0 && IsTargetProcess(pid)) {
-            if (eventType == EventType::Allocation) {
-                // AdapterAllocation: get allocSize and hVidMmGlobalAlloc, store in map
-                GetEventPropertyULONGLONG(pEvent, pInfo, L"allocSize", &size);
-                GetEventPropertyULONGLONG(pEvent, pInfo, L"hVidMmGlobalAlloc", &allocPtr);
+    // If no PID in properties, use event header PID
+    if (!foundPid || pid == 0) {
+        pid = pEvent->EventHeader.ProcessId;
+    }
 
-                if (allocPtr != 0 && size != 0) {
-                    std::lock_guard<std::mutex> lock(g_allocationMapMutex);
-                    g_allocationSizeMap[allocPtr] = size;
+    // Check if this is our target process
+    if (pid != 0 && IsTargetProcess(pid)) {
+        if (eventType == EventType::Allocation) {
+            // AdapterAllocation: get allocSize and hVidMmGlobalAlloc
+            GetEventPropertyULONGLONG(pEvent, pInfo, L"allocSize", &size);
+            ULONGLONG globalAlloc = 0;
+            GetEventPropertyULONGLONG(pEvent, pInfo, L"hVidMmGlobalAlloc", &globalAlloc);
+
+            allocPtr = globalAlloc;
+
+            if (size != 0 && globalAlloc != 0) {
+                std::lock_guard<std::mutex> lock(g_allocationMapMutex);
+                g_allocationSizeMap[globalAlloc] = size;
+            }
+        }
+        else if (eventType == EventType::Free) {
+            // TerminateAllocation: get hVidMmAlloc, look up size, remove from map
+            GetEventPropertyULONGLONG(pEvent, pInfo, L"hVidMmAlloc", &allocPtr);
+
+            if (allocPtr != 0) {
+                std::lock_guard<std::mutex> lock(g_allocationMapMutex);
+                auto it = g_allocationSizeMap.find(allocPtr);
+                if (it != g_allocationSizeMap.end()) {
+                    size = it->second;
+                    g_allocationSizeMap.erase(it);
                 }
             }
-            else if (eventType == EventType::Free) {
-                // TerminateAllocation: get hVidMmAlloc, look up size, remove from map
-                GetEventPropertyULONGLONG(pEvent, pInfo, L"hVidMmAlloc", &allocPtr);
-
-                if (allocPtr != 0) {
-                    std::lock_guard<std::mutex> lock(g_allocationMapMutex);
-                    auto it = g_allocationSizeMap.find(allocPtr);
-                    if (it != g_allocationSizeMap.end()) {
-                        size = it->second;
-                        g_allocationSizeMap.erase(it);
-                    }
-                }
-            }
-
-            PrintEventInfo(pEvent, pInfo, pid, eventType, size);
         }
+
+        PrintEventInfo(pEvent, pInfo, pid, eventType, size);
     }
 
     free(pInfo);
@@ -696,7 +728,7 @@ int wmain(int argc, wchar_t* argv[]) {
         g_sessionHandle,
         &DXGKRNL_PROVIDER_GUID,
         EVENT_CONTROL_CODE_ENABLE_PROVIDER,
-        TRACE_LEVEL_INFORMATION,
+        TRACE_LEVEL_VERBOSE,  // Use VERBOSE to get all events
         matchAnyKeyword,
         0,
         0,
