@@ -645,8 +645,13 @@ void WINAPI EventRecordCallback(PEVENT_RECORD pEvent) {
             }
         }
         else if (eventType == EventType::Free) {
-            // TerminateAllocation: get hVidMmAlloc, look up size, remove from map
-            GetEventPropertyULONGLONG(pEvent, pInfo, L"hVidMmAlloc", &allocPtr);
+            // TerminateAllocation: try hVidMmGlobalAlloc first (matches ALLOC), then hVidMmAlloc
+            ULONGLONG globalAlloc = 0;
+            GetEventPropertyULONGLONG(pEvent, pInfo, L"hVidMmGlobalAlloc", &globalAlloc);
+            if (globalAlloc == 0) {
+                GetEventPropertyULONGLONG(pEvent, pInfo, L"hVidMmAlloc", &globalAlloc);
+            }
+            allocPtr = globalAlloc;
 
             if (allocPtr != 0) {
                 std::lock_guard<std::mutex> lock(g_allocationMapMutex);
