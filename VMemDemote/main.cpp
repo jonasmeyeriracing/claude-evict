@@ -48,6 +48,11 @@ static std::atomic<ULONG> g_freeCount{ 0 };
 static std::atomic<ULONG> g_evictionCount{ 0 };
 static std::atomic<ULONG> g_madeResidentCount{ 0 };
 
+// Debug: track FREE correlation success/failure
+static std::atomic<ULONG> g_freeWithSize{ 0 };
+static std::atomic<ULONG> g_freeNoCorrelation{ 0 };
+static std::atomic<ULONG> g_deviceAllocCount{ 0 };
+
 // Track demoted commitment from VidMmProcessDemotedCommitmentChange events
 static std::atomic<ULONGLONG> g_currentDemotedCommitment{ 0 };
 static std::atomic<ULONGLONG> g_peakDemotedCommitment{ 0 };
@@ -136,6 +141,9 @@ void ResetStatistics() {
     g_madeResidentCount = 0;
     g_currentDemotedCommitment = 0;
     g_peakDemotedCommitment = 0;
+    g_freeWithSize = 0;
+    g_freeNoCorrelation = 0;
+    g_deviceAllocCount = 0;
 
     // Clear allocation tracking maps
     {
@@ -431,6 +439,10 @@ void PrintStatistics() {
     wprintf(L"Net Memory:    %s%s\n", net < 0 ? L"-" : L"", netStr);
     wprintf(L"Peak Demoted:  %s\n", demotedStr);
     wprintf(L"Made Resident: %lu (Total: %s)\n", g_madeResidentCount.load(), residentStr);
+    wprintf(L"--- FREE Correlation Debug ---\n");
+    wprintf(L"DeviceAlloc events: %lu\n", g_deviceAllocCount.load());
+    wprintf(L"FREE with size:     %lu\n", g_freeWithSize.load());
+    wprintf(L"FREE no correlation:%lu\n", g_freeNoCorrelation.load());
     wprintf(L"===============================\n\n");
 }
 
@@ -571,24 +583,17 @@ void WINAPI EventRecordCallback(PEVENT_RECORD pEvent) {
     }
 
     // Handle DeviceAllocation - links hVidMmAlloc to hVidMmGlobalAlloc for FREE correlation
+    // NOTE: These events come from system processes (DWM), not the target process,
+    // so we capture ALL of them to build a global correlation map
     if (taskName && _wcsicmp(taskName, TASK_DEVICE_ALLOCATION) == 0) {
-        DWORD eventPid = 0;
-        ULONGLONG hProcessId = 0;
-        if (!GetEventPropertyDWORD(pEvent, pInfo, L"ProcessId", &eventPid) || eventPid == 0) {
-            if (GetEventPropertyULONGLONG(pEvent, pInfo, L"hProcessId", &hProcessId) && hProcessId != 0) {
-                eventPid = (DWORD)hProcessId;
-            }
-        }
+        ULONGLONG hVidMmAlloc = 0, hVidMmGlobalAlloc = 0;
+        GetEventPropertyULONGLONG(pEvent, pInfo, L"hVidMmAlloc", &hVidMmAlloc);
+        GetEventPropertyULONGLONG(pEvent, pInfo, L"hVidMmGlobalAlloc", &hVidMmGlobalAlloc);
 
-        if (CheckTargetProcess(eventPid)) {
-            ULONGLONG hVidMmAlloc = 0, hVidMmGlobalAlloc = 0;
-            GetEventPropertyULONGLONG(pEvent, pInfo, L"hVidMmAlloc", &hVidMmAlloc);
-            GetEventPropertyULONGLONG(pEvent, pInfo, L"hVidMmGlobalAlloc", &hVidMmGlobalAlloc);
-
-            if (hVidMmAlloc != 0 && hVidMmGlobalAlloc != 0) {
-                std::lock_guard<std::mutex> lock(g_allocHandleMapMutex);
-                g_allocHandleMap[hVidMmAlloc] = hVidMmGlobalAlloc;
-            }
+        if (hVidMmAlloc != 0 && hVidMmGlobalAlloc != 0) {
+            std::lock_guard<std::mutex> lock(g_allocHandleMapMutex);
+            g_allocHandleMap[hVidMmAlloc] = hVidMmGlobalAlloc;
+            g_deviceAllocCount++;
         }
         free(pInfo);
         return;
@@ -724,9 +729,16 @@ void WINAPI EventRecordCallback(PEVENT_RECORD pEvent) {
                     if (it != g_allocationSizeMap.end()) {
                         size = it->second;
                         g_allocationSizeMap.erase(it);
+                        g_freeWithSize++;
+                    } else {
+                        g_freeNoCorrelation++;
                     }
+                } else {
+                    g_freeNoCorrelation++;
                 }
                 allocPtr = hVidMmGlobalAlloc;
+            } else {
+                g_freeNoCorrelation++;
             }
         }
 
