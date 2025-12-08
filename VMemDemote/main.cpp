@@ -382,10 +382,12 @@ void PrintEventInfo(PEVENT_RECORD pEvent, PTRACE_EVENT_INFO /*pInfo*/, DWORD pid
     // Format running totals
     wchar_t allocTotalStr[64], evictTotalStr[64], residentTotalStr[64];
     ULONGLONG allocated = g_totalAllocated.load();
+    ULONGLONG freed = g_totalFreed.load();
+    ULONGLONG netAlloc = (allocated > freed) ? (allocated - freed) : 0;
     ULONGLONG resident = g_totalMadeResident.load();
     ULONGLONG peakDemoted = g_peakDemotedCommitment.load();
 
-    FormatSize(allocated, allocTotalStr, _countof(allocTotalStr));
+    FormatSize(netAlloc, allocTotalStr, _countof(allocTotalStr));
     FormatSize(peakDemoted, evictTotalStr, _countof(evictTotalStr));
     FormatSize(resident, residentTotalStr, _countof(residentTotalStr));
 
