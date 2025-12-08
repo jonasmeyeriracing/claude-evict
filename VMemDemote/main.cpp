@@ -56,6 +56,11 @@ static std::atomic<ULONGLONG> g_peakDemotedCommitment{ 0 };
 static std::unordered_map<ULONGLONG, ULONGLONG> g_allocationSizeMap;
 static std::mutex g_allocationMapMutex;
 
+// Correlation map: hVidMmAlloc -> hVidMmGlobalAlloc
+// DeviceAllocation events have both, TerminateAllocation only has hVidMmAlloc
+static std::unordered_map<ULONGLONG, ULONGLONG> g_allocHandleMap;
+static std::mutex g_allocHandleMapMutex;
+
 // Track pVidMmAlloc pointers that belong to our target process -> size
 // We learn ownership from VidMmMakeResident events where header ProcessId is target
 static std::unordered_map<ULONGLONG, ULONGLONG> g_targetAllocSizeMap;
@@ -78,6 +83,7 @@ enum class EventType {
 
 // DxgKrnl task names we're interested in (discovered via -debug mode)
 static const wchar_t* TASK_ADAPTER_ALLOCATION = L"AdapterAllocation";         // Allocation created (has allocSize)
+static const wchar_t* TASK_DEVICE_ALLOCATION = L"DeviceAllocation";           // Links hVidMmAlloc to hVidMmGlobalAlloc
 static const wchar_t* TASK_TERMINATE_ALLOCATION = L"TerminateAllocation";     // Allocation freed
 static const wchar_t* TASK_VIDMM_EVICT = L"VidMmEvict";                       // Memory evicted from VRAM
 static const wchar_t* TASK_VIDMM_MAKE_RESIDENT = L"VidMmMakeResident";        // Memory made resident in VRAM
@@ -135,6 +141,10 @@ void ResetStatistics() {
     {
         std::lock_guard<std::mutex> lock(g_allocationMapMutex);
         g_allocationSizeMap.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_allocHandleMapMutex);
+        g_allocHandleMap.clear();
     }
     {
         std::lock_guard<std::mutex> lock(g_targetAllocMutex);
@@ -554,6 +564,30 @@ void WINAPI EventRecordCallback(PEVENT_RECORD pEvent) {
         return;
     }
 
+    // Handle DeviceAllocation - links hVidMmAlloc to hVidMmGlobalAlloc for FREE correlation
+    if (taskName && _wcsicmp(taskName, TASK_DEVICE_ALLOCATION) == 0) {
+        DWORD eventPid = 0;
+        ULONGLONG hProcessId = 0;
+        if (!GetEventPropertyDWORD(pEvent, pInfo, L"ProcessId", &eventPid) || eventPid == 0) {
+            if (GetEventPropertyULONGLONG(pEvent, pInfo, L"hProcessId", &hProcessId) && hProcessId != 0) {
+                eventPid = (DWORD)hProcessId;
+            }
+        }
+
+        if (CheckTargetProcess(eventPid)) {
+            ULONGLONG hVidMmAlloc = 0, hVidMmGlobalAlloc = 0;
+            GetEventPropertyULONGLONG(pEvent, pInfo, L"hVidMmAlloc", &hVidMmAlloc);
+            GetEventPropertyULONGLONG(pEvent, pInfo, L"hVidMmGlobalAlloc", &hVidMmGlobalAlloc);
+
+            if (hVidMmAlloc != 0 && hVidMmGlobalAlloc != 0) {
+                std::lock_guard<std::mutex> lock(g_allocHandleMapMutex);
+                g_allocHandleMap[hVidMmAlloc] = hVidMmGlobalAlloc;
+            }
+        }
+        free(pInfo);
+        return;
+    }
+
     // Determine event type from task name
     EventType eventType = GetEventTypeFromTaskName(taskName);
 
@@ -660,16 +694,33 @@ void WINAPI EventRecordCallback(PEVENT_RECORD pEvent) {
             }
         }
         else if (eventType == EventType::Free) {
-            // TerminateAllocation: use hVidMmGlobalAlloc to match ALLOC key
-            GetEventPropertyULONGLONG(pEvent, pInfo, L"hVidMmGlobalAlloc", &allocPtr);
+            // TerminateAllocation: get hVidMmAlloc, look up hVidMmGlobalAlloc via correlation map
+            ULONGLONG hVidMmAlloc = 0;
+            GetEventPropertyULONGLONG(pEvent, pInfo, L"hVidMmAlloc", &hVidMmAlloc);
 
-            if (allocPtr != 0) {
-                std::lock_guard<std::mutex> lock(g_allocationMapMutex);
-                auto it = g_allocationSizeMap.find(allocPtr);
-                if (it != g_allocationSizeMap.end()) {
-                    size = it->second;
-                    g_allocationSizeMap.erase(it);
+            if (hVidMmAlloc != 0) {
+                ULONGLONG hVidMmGlobalAlloc = 0;
+
+                // Look up the corresponding hVidMmGlobalAlloc from DeviceAllocation events
+                {
+                    std::lock_guard<std::mutex> lock(g_allocHandleMapMutex);
+                    auto handleIt = g_allocHandleMap.find(hVidMmAlloc);
+                    if (handleIt != g_allocHandleMap.end()) {
+                        hVidMmGlobalAlloc = handleIt->second;
+                        g_allocHandleMap.erase(handleIt);
+                    }
                 }
+
+                // Now look up the size from the allocation map
+                if (hVidMmGlobalAlloc != 0) {
+                    std::lock_guard<std::mutex> lock(g_allocationMapMutex);
+                    auto it = g_allocationSizeMap.find(hVidMmGlobalAlloc);
+                    if (it != g_allocationSizeMap.end()) {
+                        size = it->second;
+                        g_allocationSizeMap.erase(it);
+                    }
+                }
+                allocPtr = hVidMmGlobalAlloc;
             }
         }
 
