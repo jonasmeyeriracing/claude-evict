@@ -517,11 +517,15 @@ void WINAPI EventRecordCallback(PEVENT_RECORD pEvent) {
                 g_evictionCount++;
             }
 
-            // Print demoted commitment changes
-            wchar_t newVal[64], peakVal[64];
+            // Print demoted commitment changes with totals
+            wchar_t newVal[64], peakVal[64], allocTotalStr[64], evictTotalStr[64], residentTotalStr[64];
             FormatSize(newDemoted, newVal, _countof(newVal));
             FormatSize(g_peakDemotedCommitment.load(), peakVal, _countof(peakVal));
-            wprintf(L"[DEMOTED] Current: %s, Peak: %s\n", newVal, peakVal);
+            FormatSize(g_totalAllocated.load() - g_totalFreed.load(), allocTotalStr, _countof(allocTotalStr));
+            FormatSize(g_peakDemotedCommitment.load(), evictTotalStr, _countof(evictTotalStr));
+            FormatSize(g_totalMadeResident.load(), residentTotalStr, _countof(residentTotalStr));
+            wprintf(L"[DEMOTED] Current: %s, Peak: %s | Totals: Alloc=%s, Evict=%s, Resident=%s\n",
+                    newVal, peakVal, allocTotalStr, evictTotalStr, residentTotalStr);
             fflush(stdout);
         }
         free(pInfo);
