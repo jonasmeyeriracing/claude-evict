@@ -90,6 +90,7 @@ enum class EventType {
 static const wchar_t* TASK_ADAPTER_ALLOCATION = L"AdapterAllocation";         // Allocation created (has allocSize)
 static const wchar_t* TASK_DEVICE_ALLOCATION = L"DeviceAllocation";           // Links hVidMmAlloc to hVidMmGlobalAlloc
 static const wchar_t* TASK_TERMINATE_ALLOCATION = L"TerminateAllocation";     // Allocation freed
+static const wchar_t* TASK_PROCESS_TERMINATE_ALLOCATION = L"ProcessTerminateAllocation"; // Process allocation freed
 static const wchar_t* TASK_VIDMM_EVICT = L"VidMmEvict";                       // Memory evicted from VRAM
 static const wchar_t* TASK_VIDMM_MAKE_RESIDENT = L"VidMmMakeResident";        // Memory made resident in VRAM
 static const wchar_t* TASK_VIDMM_PROCESS_USAGE_CHANGE = L"VidMmProcessUsageChange"; // Memory usage delta (has size info)
@@ -352,6 +353,20 @@ const wchar_t* GetEventTypeName(EventType type) {
 
 // Print event properties for debugging/information
 void PrintEventInfo(PEVENT_RECORD pEvent, PTRACE_EVENT_INFO /*pInfo*/, DWORD pid, EventType eventType, ULONGLONG size) {
+    // Print periodic stats summary (every 10 seconds)
+    static ULONGLONG lastStatsTime = 0;
+    ULONGLONG currentTime = pEvent->EventHeader.TimeStamp.QuadPart;
+    // 10 million = 1 second in 100-nanosecond units
+    if (currentTime - lastStatsTime > 100000000ULL) { // 10 seconds
+        lastStatsTime = currentTime;
+        std::lock_guard<std::mutex> lock1(g_allocationMapMutex);
+        std::lock_guard<std::mutex> lock2(g_allocHandleMapMutex);
+        wprintf(L"[STATS] DevAlloc=%lu, FreeWithSize=%lu, FreeNoCorr=%lu, SizeMap=%zu, HandleMap=%zu\n",
+                g_deviceAllocCount.load(), g_freeWithSize.load(), g_freeNoCorrelation.load(),
+                g_allocationSizeMap.size(), g_allocHandleMap.size());
+        fflush(stdout);
+    }
+
     // Update statistics first
     switch (eventType) {
         case EventType::Allocation:
@@ -443,6 +458,12 @@ void PrintStatistics() {
     wprintf(L"DeviceAlloc events: %lu\n", g_deviceAllocCount.load());
     wprintf(L"FREE with size:     %lu\n", g_freeWithSize.load());
     wprintf(L"FREE no correlation:%lu\n", g_freeNoCorrelation.load());
+    {
+        std::lock_guard<std::mutex> lock1(g_allocationMapMutex);
+        std::lock_guard<std::mutex> lock2(g_allocHandleMapMutex);
+        wprintf(L"Alloc size map entries:  %zu\n", g_allocationSizeMap.size());
+        wprintf(L"Handle correlation map:  %zu\n", g_allocHandleMap.size());
+    }
     wprintf(L"===============================\n\n");
 }
 
@@ -455,7 +476,8 @@ EventType GetEventTypeFromTaskName(const wchar_t* taskName) {
     if (_wcsicmp(taskName, TASK_ADAPTER_ALLOCATION) == 0) {
         return EventType::Allocation;
     }
-    if (_wcsicmp(taskName, TASK_TERMINATE_ALLOCATION) == 0) {
+    if (_wcsicmp(taskName, TASK_TERMINATE_ALLOCATION) == 0 ||
+        _wcsicmp(taskName, TASK_PROCESS_TERMINATE_ALLOCATION) == 0) {
         return EventType::Free;
     }
     if (_wcsicmp(taskName, TASK_VIDMM_EVICT) == 0) {
@@ -732,9 +754,12 @@ void WINAPI EventRecordCallback(PEVENT_RECORD pEvent) {
                         g_freeWithSize++;
                     } else {
                         g_freeNoCorrelation++;
+                        // Debug: allocation map had no entry for this global handle
+                        // This means we didn't see the AdapterAllocation for this process
                     }
                 } else {
                     g_freeNoCorrelation++;
+                    // Debug: no DeviceAllocation mapping for this hVidMmAlloc
                 }
                 allocPtr = hVidMmGlobalAlloc;
             } else {
